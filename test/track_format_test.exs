@@ -172,6 +172,76 @@ defmodule Membrane.MoQ.TrackFormatTest do
     end
   end
 
+  # The catalog is published by a remote peer: nothing in it may crash the Source
+  # or the downstream parsers.
+  describe "invalid catalog values" do
+    @remote_stream %RemoteStream{type: :packetized}
+
+    test "an unknown AAC audio object type maps to a RemoteStream" do
+      for aot_id <- [0, 99, 255, nil] do
+        native = %WebCodecs.AudioTrackFormat{
+          params: %{sample_rate: 44_100, channels: 2},
+          codec: %WebCodecs.AACCodec{profile: aot_id}
+        }
+
+        assert TrackFormat.to_stream_format(native) == @remote_stream
+      end
+    end
+
+    test "a non-positive AAC sample rate or channel count maps to a RemoteStream" do
+      for {sample_rate, channels} <- [{0, 2}, {44_100, 0}, {nil, 2}, {-1, 2}] do
+        native = %WebCodecs.AudioTrackFormat{
+          params: %{sample_rate: sample_rate, channels: channels},
+          codec: %WebCodecs.AACCodec{profile: AAC.profile_to_aot_id(:LC)}
+        }
+
+        assert TrackFormat.to_stream_format(native) == @remote_stream
+      end
+    end
+
+    test "a non-positive Opus channel count maps to a RemoteStream" do
+      native = %WebCodecs.AudioTrackFormat{
+        params: %{sample_rate: 48_000, channels: 0},
+        codec: :opus
+      }
+
+      assert TrackFormat.to_stream_format(native) == @remote_stream
+    end
+
+    test "an invalid H264 decoder configuration record maps to a RemoteStream" do
+      # garbage, a header-only record claiming an SPS array that is not there,
+      # and one whose SPS is truncated
+      for dcr <- [
+            <<1, 2, 3>>,
+            <<1, 100, 0, 31, 0b111111::6, 3::2, 0b111::3, 1::5>>,
+            <<1, 100, 0, 31, 0b111111::6, 3::2, 0b111::3, 1::5, 10::16, 1, 2>>
+          ],
+          in_band <- [true, false] do
+        native = %WebCodecs.VideoTrackFormat{
+          params: %{width: 1280, height: 720, framerate: 30.0},
+          description: dcr,
+          codec: %WebCodecs.H264Codec{in_band: in_band, profile: 100, constraints: 0, level: 31}
+        }
+
+        assert TrackFormat.to_stream_format(native) == @remote_stream
+      end
+    end
+
+    test "an invalid H265 decoder configuration record maps to a RemoteStream" do
+      # garbage, and a valid header followed by a truncated VPS array
+      for dcr <- [<<1, 2, 3>>, hvcc_with_arrays(1) <> <<2::2, 32::6, 1::16, 10::16, 1, 2>>],
+          in_band <- [true, false] do
+        native = %WebCodecs.VideoTrackFormat{
+          params: %{width: 1280, height: 720, framerate: 30.0},
+          description: dcr,
+          codec: h265_codec(in_band)
+        }
+
+        assert TrackFormat.to_stream_format(native) == @remote_stream
+      end
+    end
+  end
+
   describe "keyframe?/2" do
     test "reads the parser metadata on video buffers" do
       for {codec_key, fmt} <- [{:h264, %H264{}}, {:h265, %H265{}}], kf <- [true, false] do
@@ -219,7 +289,9 @@ defmodule Membrane.MoQ.TrackFormatTest do
   end
 
   # Minimal valid hvcC (H265 decoder configuration record) with no NAL arrays.
-  defp hvcc do
+  defp hvcc, do: hvcc_with_arrays(0)
+
+  defp hvcc_with_arrays(num_of_arrays) do
     <<1::8, _profile_space = 0::2, _tier_flag = 0::1, _profile_idc = 1::5,
       _profile_compatibility_flags = 0x60000000::32,
       _constraint_indicator_flags = 0x900000000000::48, _level_idc = 93::8, 0b1111::4,
@@ -227,6 +299,6 @@ defmodule Membrane.MoQ.TrackFormatTest do
       _chroma_format_idc = 1::2, 0b11111::5, _bit_depth_luma_minus8 = 0::3, 0b11111::5,
       _bit_depth_chroma_minus8 = 0::3, _avg_frame_rate = 0::16, _constant_frame_rate = 0::2,
       _num_temporal_layers = 1::3, _temporal_id_nested = 0::1, _length_size_minus_one = 3::2,
-      _num_of_arrays = 0::8>>
+      num_of_arrays::8>>
   end
 end

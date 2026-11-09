@@ -3,6 +3,8 @@ defmodule Membrane.MoQ.TrackFormat do
   # Codec translation between Membrane stream formats
   # and the native MoQ track-format term (`t:ExMoQ.Native.track_format/0`).
 
+  require Logger
+
   alias ExMoQ.Native
   alias ExMoQ.WebCodecs
 
@@ -91,6 +93,11 @@ defmodule Membrane.MoQ.TrackFormat do
   @doc """
   Reconstruct a Membrane stream format from a native track-format term,
   or `RemoteStream.t()` if it is not recognized.
+
+  The term is decoded from the catalog published by a remote peer, so values
+  that cannot be trusted (decoder configuration records, codec profiles,
+  sample rates, channel counts) are validated here and an invalid rendition
+  is advertised as unrecognized instead of raising or being passed downstream.
   """
   @spec to_stream_format(Native.track_format() | :unrecognized) ::
           H264.t() | H265.t() | AAC.t() | Opus.t() | RemoteStream.t()
@@ -99,12 +106,18 @@ defmodule Membrane.MoQ.TrackFormat do
         description: dcr,
         codec: %WebCodecs.H264Codec{in_band: in_band}
       }) do
-    %H264{
-      width: dimension(width),
-      height: dimension(height),
-      framerate: float_to_framerate(framerate),
-      stream_structure: h264_stream_structure(dcr, in_band)
-    }
+    case h264_stream_structure(dcr, in_band) do
+      {:ok, stream_structure} ->
+        %H264{
+          width: dimension(width),
+          height: dimension(height),
+          framerate: float_to_framerate(framerate),
+          stream_structure: stream_structure
+        }
+
+      :error ->
+        unrecognized("H264 rendition with an invalid decoder configuration record")
+    end
   end
 
   def to_stream_format(%WebCodecs.VideoTrackFormat{
@@ -112,30 +125,46 @@ defmodule Membrane.MoQ.TrackFormat do
         description: dcr,
         codec: %WebCodecs.H265Codec{in_band: in_band}
       }) do
-    %H265{
-      width: dimension(width),
-      height: dimension(height),
-      framerate: float_to_framerate(framerate),
-      stream_structure: h265_stream_structure(dcr, in_band)
-    }
+    case h265_stream_structure(dcr, in_band) do
+      {:ok, stream_structure} ->
+        %H265{
+          width: dimension(width),
+          height: dimension(height),
+          framerate: float_to_framerate(framerate),
+          stream_structure: stream_structure
+        }
+
+      :error ->
+        unrecognized("H265 rendition with an invalid decoder configuration record")
+    end
   end
 
   def to_stream_format(%WebCodecs.AudioTrackFormat{
         params: %{sample_rate: sample_rate, channels: channels},
-        codec: %WebCodecs.AACCodec{profile: profile}
+        codec: %WebCodecs.AACCodec{profile: aot_id}
       }) do
-    %AAC{
-      sample_rate: sample_rate,
-      channels: channels,
-      profile: AAC.aot_id_to_profile(profile)
-    }
+    with {:ok, profile} <- aac_profile(aot_id),
+         true <- positive_integer?(sample_rate) and positive_integer?(channels) do
+      %AAC{sample_rate: sample_rate, channels: channels, profile: profile}
+    else
+      _invalid -> unrecognized("AAC rendition with invalid profile, sample rate or channels")
+    end
   end
 
   def to_stream_format(%WebCodecs.AudioTrackFormat{params: %{channels: channels}, codec: :opus}) do
-    %Opus{channels: channels, self_delimiting?: false}
+    if positive_integer?(channels) do
+      %Opus{channels: channels, self_delimiting?: false}
+    else
+      unrecognized("Opus rendition with invalid channels")
+    end
   end
 
   def to_stream_format(:unrecognized), do: %Membrane.RemoteStream{type: :packetized}
+
+  defp unrecognized(reason) do
+    Logger.warning("Ignoring catalog track format: #{reason}, treating the track as unrecognized")
+    to_stream_format(:unrecognized)
+  end
 
   @spec keyframe?(Membrane.Buffer.t(), Membrane.StreamFormat.t()) :: boolean()
   def keyframe?(%Membrane.Buffer{metadata: %{h264: %{key_frame?: kf}}}, %H264{}), do: kf
@@ -159,15 +188,47 @@ defmodule Membrane.MoQ.TrackFormat do
   # with a catalog description carries length-prefixed samples, one without
   # carries Annex B with in-band parameter sets (regardless of the avc1/avc3
   # flag, which only describes where the parameter sets live).
-  @spec h264_stream_structure(binary(), boolean()) :: H264.stream_structure()
-  defp h264_stream_structure(<<>>, _in_band), do: :annexb
-  defp h264_stream_structure(dcr, true), do: {:avc3, dcr}
-  defp h264_stream_structure(dcr, false), do: {:avc1, dcr}
+  @spec h264_stream_structure(binary(), boolean()) :: {:ok, H264.stream_structure()} | :error
+  defp h264_stream_structure(<<>>, _in_band), do: {:ok, :annexb}
 
-  @spec h265_stream_structure(binary(), boolean()) :: H265.stream_structure()
-  defp h265_stream_structure(<<>>, _in_band), do: :annexb
-  defp h265_stream_structure(dcr, true), do: {:hev1, dcr}
-  defp h265_stream_structure(dcr, false), do: {:hvc1, dcr}
+  defp h264_stream_structure(dcr, in_band) do
+    if valid_dcr?(H264.DecoderConfigurationRecord, dcr),
+      do: {:ok, {if(in_band, do: :avc3, else: :avc1), dcr}},
+      else: :error
+  end
+
+  @spec h265_stream_structure(binary(), boolean()) :: {:ok, H265.stream_structure()} | :error
+  defp h265_stream_structure(<<>>, _in_band), do: {:ok, :annexb}
+
+  defp h265_stream_structure(dcr, in_band) do
+    if valid_dcr?(H265.DecoderConfigurationRecord, dcr),
+      do: {:ok, {if(in_band, do: :hev1, else: :hvc1), dcr}},
+      else: :error
+  end
+
+  # The downstream parser does `DecoderConfigurationRecord.parse/1` on the record and
+  # crashes on an invalid one, so check here that it parses. `parse/1` returns
+  # `{:error, _}` on a bad header and raises on truncated parameter-set arrays.
+  @spec valid_dcr?(module(), term()) :: boolean()
+  defp valid_dcr?(module, dcr) when is_binary(dcr) do
+    match?(%{__struct__: ^module}, module.parse(dcr))
+  rescue
+    _error -> false
+  end
+
+  defp valid_dcr?(_module, _dcr), do: false
+
+  # membrane_aac_format raises on unknown audio object type ids
+  @spec aac_profile(term()) :: {:ok, AAC.profile()} | :error
+  defp aac_profile(aot_id) when is_integer(aot_id) do
+    {:ok, AAC.aot_id_to_profile(aot_id)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp aac_profile(_aot_id), do: :error
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   @spec framerate_to_float({integer(), integer()} | nil) :: float() | nil
   defp framerate_to_float({num, den}) when is_integer(num) and is_integer(den) and den > 0,
